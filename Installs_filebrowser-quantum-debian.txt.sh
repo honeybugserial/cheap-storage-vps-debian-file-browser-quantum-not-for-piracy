@@ -15,7 +15,8 @@
 #   password   Reset a user's password (or create a user)
 #   swap       Add, resize or remove a swap file
 #   fail2ban   Block brute-force attacks on SSH and FileBrowser logins
-#   https      Add a domain, get a Let's Encrypt certificate, enable HSTS
+#   duckdns    Keep a DuckDNS name pointed at this server (set up or check status)
+#   https      HTTPS with Let's Encrypt (set up, or check status and fix issues)
 #
 # Install settings can be preset as environment variables (they become the
 # default answers): DATA_DIR, PUBLIC_URL, FB_PORT, FB_VERSION
@@ -39,6 +40,11 @@ SWAPFILE="/swapfile"
 SWAPPINESS_CONF="/etc/sysctl.d/99-swappiness.conf"
 LOG_FILE="/var/log/filebrowser-setup.log"
 MARKER="# Managed by filebrowser-setup.sh"
+DUCK_CONF="/etc/duckdns.conf"
+DUCK_BIN="/usr/local/bin/duckdns-update"
+DUCK_STATE="/var/lib/duckdns/last"
+DUCK_SVC="/etc/systemd/system/duckdns-update.service"
+DUCK_TIMER="/etc/systemd/system/duckdns-update.timer"
 
 # Optional preset answers from the environment
 ENV_DATA_DIR="${DATA_DIR:-}"
@@ -54,7 +60,7 @@ for arg in "$@"; do
   case "$arg" in
     -y|--yes) ASSUME_YES=yes ;;
     -h|--help|help) usage; exit 0 ;;
-    install|check|update|password|swap|fail2ban|https) ACTION="$arg" ;;
+    install|check|update|password|swap|fail2ban|duckdns|https) ACTION="$arg" ;;
     *) echo "Unknown option: $arg (try --help)"; exit 1 ;;
   esac
 done
@@ -212,6 +218,108 @@ nginx_test_reload() {
   if err="$(nginx -t 2>&1)"; then systemctl reload nginx; return 0; fi
   echo "$err"
   return 1
+}
+
+# The nginx site that serves FileBrowser, found by what it proxies to (whatever the file is called)
+ngx_site() {
+  local f port
+  port="$(cfg_port)"
+  for f in /etc/nginx/sites-enabled/*; do
+    [[ -e "$f" ]] || continue
+    if grep -q "proxy_pass http://127.0.0.1:${port}" "$f" 2>/dev/null; then readlink -f "$f"; return 0; fi
+  done
+  echo "$NGX_SITE"
+}
+https_on() { grep -q "managed by Certbot" "$1" 2>/dev/null; }
+site_domain() { sed -nE 's/^[[:space:]]*server_name[[:space:]]+([^;[:space:]]+).*/\1/p' "$1" 2>/dev/null | grep -vx '_' | head -1 || true; }
+
+# cert_info <site> -> sets CERT_END CERT_DAYS (returns 1 if there's no certificate)
+cert_info() {
+  local f end
+  CERT_END=""; CERT_DAYS=""
+  f="$(sed -nE 's/^[[:space:]]*ssl_certificate[[:space:]]+([^;[:space:]]+);.*/\1/p' "$1" 2>/dev/null | head -1 || true)"
+  if [[ -z "$f" || ! -f "$f" ]] || ! command -v openssl >/dev/null 2>&1; then return 1; fi
+  end="$(openssl x509 -enddate -noout -in "$f" 2>/dev/null | cut -d= -f2 || true)"
+  if [[ -z "$end" ]]; then return 1; fi
+  CERT_DAYS=$(( ( $(date -d "$end" +%s) - $(date +%s) ) / 86400 ))
+  CERT_END="$(date -d "$end" +%Y-%m-%d)"
+}
+
+# dns_check <domain> -> sets DNS_IPS; returns 0 if it points at this server, 1 if elsewhere, 2 if not resolving
+dns_check() {
+  local ip mine
+  DNS_IPS="$(getent ahostsv4 "$1" 2>/dev/null | awk '{print $1}' | sort -u | paste -sd' ' - || true)"
+  if [[ -z "$DNS_IPS" ]]; then return 2; fi
+  mine=" $(hostname -I 2>/dev/null) $(duck_last_ip) "
+  for ip in $DNS_IPS; do
+    if [[ "$mine" == *" $ip "* ]]; then return 0; fi
+  done
+  return 1
+}
+
+# DuckDNS helpers
+duck_configured() { [[ -f "$DUCK_CONF" ]]; }
+duck_domains() { sed -nE 's/^DUCKDNS_DOMAINS="?([^"]*)"?.*/\1/p' "$DUCK_CONF" 2>/dev/null | head -1 || true; }
+duck_first_fqdn() {
+  local d
+  d="$(duck_domains)"
+  if [[ -z "$d" ]] && duck_external; then d="$EXT_DOMAINS"; fi
+  d="${d%%,*}"
+  if [[ -n "$d" ]]; then echo "${d}.duckdns.org"; fi
+}
+# --- DuckDNS updaters set up outside this script (e.g. duckdns.org's duck.sh + cron)
+EXT_LINE=""; EXT_SCRIPT=""; EXT_LOG=""; EXT_DOMAINS=""; EXT_TOKEN=""
+duck_external() {
+  local home src url
+  EXT_LINE=""; EXT_SCRIPT=""; EXT_LOG=""; EXT_DOMAINS=""; EXT_TOKEN=""
+  command -v crontab >/dev/null 2>&1 || return 1
+  EXT_LINE="$(crontab -l 2>/dev/null | grep -vE '^[[:space:]]*#' | grep -E 'duckdns\.org/update|duck[^[:space:]/]*\.sh' | head -1 || true)"
+  if [[ -z "$EXT_LINE" ]]; then return 1; fi
+  home="$(getent passwd root | cut -d: -f6)"
+  EXT_SCRIPT="$(grep -oE '[^[:space:]]*duck[^[:space:]]*\.sh' <<<"$EXT_LINE" | head -1 || true)"
+  EXT_SCRIPT="${EXT_SCRIPT/#\~/$home}"
+  if [[ -n "$EXT_SCRIPT" && -r "$EXT_SCRIPT" ]]; then src="$(cat "$EXT_SCRIPT")"; else src="$EXT_LINE"; fi
+  url="$(grep -oE 'duckdns\.org/update\?[^"'"'"'[:space:]]*' <<<"$src" | head -1 || true)"
+  EXT_DOMAINS="$(sed -nE 's/.*[?&]domains=([^&]*).*/\1/p' <<<"$url")"
+  EXT_TOKEN="$(sed -nE 's/.*[?&]token=([^&]*).*/\1/p' <<<"$url")"
+  EXT_LOG="$(grep -oE '\-o[[:space:]]+[^[:space:]]+' <<<"$src" | head -1 | awk '{print $2}' || true)"
+  EXT_LOG="${EXT_LOG/#\~/$home}"
+  if [[ -z "$EXT_LOG" && -n "$EXT_SCRIPT" ]]; then EXT_LOG="$(dirname "$EXT_SCRIPT")/duck.log"; fi
+  return 0
+}
+duck_external_lines() {
+  local res age d st=0
+  c_info "Updated by a cron job that this script didn't set up:"
+  c_info "  $EXT_LINE"
+  if [[ -n "$EXT_DOMAINS" ]]; then c_info "Names: $(sed 's/,/.duckdns.org, /g' <<<"$EXT_DOMAINS").duckdns.org"; fi
+  if [[ -n "$EXT_LOG" && -f "$EXT_LOG" ]]; then
+    res="$(tr -d '[:space:]' < "$EXT_LOG")"
+    age=$(( ( $(date +%s) - $(stat -c %Y "$EXT_LOG") ) / 60 ))
+    if [[ "$res" == OK* ]]; then
+      if (( age > 15 )); then c_warn "Last successful update was $age minutes ago"; else c_ok "Last update OK, $age min ago"; fi
+    else
+      c_bad "Last update returned '${res:-nothing}' ($age min ago); check the token and subdomain"
+    fi
+  else
+    c_info "No update log found, so the last result is unknown"
+  fi
+  if [[ -n "$EXT_DOMAINS" ]]; then
+    d="${EXT_DOMAINS%%,*}.duckdns.org"
+    dns_check "$d" || st=$?
+    case "$st" in
+      0) c_ok "$d resolves to this server ($DNS_IPS)" ;;
+      2) c_warn "$d doesn't resolve" ;;
+      *) c_warn "$d resolves to $DNS_IPS, not this server" ;;
+    esac
+  fi
+}
+
+duck_last() { cat "$DUCK_STATE" 2>/dev/null || true; }           # "YYYY-MM-DD HH:MM:SS OK 1.2.3.4 UPDATED"
+duck_last_ip() { duck_last | awk '$3 == "OK" {print $4}'; }
+duck_last_age_min() {
+  local t
+  t="$(duck_last | awk '{print $1" "$2}')"
+  if [[ -n "$t" ]]; then echo $(( ( $(date +%s) - $(date -d "$t" +%s) ) / 60 )); fi
 }
 
 # ================================================================== install ==
@@ -434,27 +542,32 @@ EOF
 
   # ---- nginx
   step "Configuring nginx"
-  if [[ -f "$NGX_SITE" ]] && grep -q "managed by Certbot" "$NGX_SITE"; then
-    info "nginx config has HTTPS set up by Certbot; leaving it alone"
+  local CUR_SITE other
+  CUR_SITE="$(ngx_site)"
+  if https_on "$CUR_SITE"; then
+    # Never replace a working HTTPS site, whatever it's called
+    info "nginx site $(basename "$CUR_SITE") already has HTTPS; leaving it alone"
   else
     write_nginx_site "$PORT"
+    ln -sf "$NGX_SITE" /etc/nginx/sites-enabled/filebrowser
+    rm -f /etc/nginx/sites-enabled/default
+    # Retire any other plain-HTTP site (e.g. from a manual setup) that proxies to the same FileBrowser
+    for other in /etc/nginx/sites-enabled/*; do
+      [[ -e "$other" ]] || continue
+      if [[ "$(readlink -f "$other")" == "$NGX_SITE" ]]; then continue; fi
+      if grep -q "proxy_pass http://127.0.0.1:${PORT}" "$other" 2>/dev/null; then
+        rm -f "$other"
+        info "Disabled older nginx site $(basename "$other") (it pointed at the same FileBrowser)"
+      fi
+    done
   fi
-  ln -sf "$NGX_SITE" /etc/nginx/sites-enabled/filebrowser
-  rm -f /etc/nginx/sites-enabled/default
-  # Retire any other site (e.g. from a manual setup) that proxies to the same FileBrowser port
-  local other
-  for other in /etc/nginx/sites-enabled/*; do
-    [[ -e "$other" ]] || continue
-    if [[ "$(readlink -f "$other")" == "$NGX_SITE" ]]; then continue; fi
-    if grep -q "proxy_pass http://127.0.0.1:${PORT}" "$other" 2>/dev/null; then
-      rm -f "$other"
-      info "Disabled older nginx site $(basename "$other") (it pointed at the same FileBrowser)"
-    fi
-  done
   systemctl enable --now nginx >/dev/null 2>&1
   nginx_test_reload || die "nginx config test failed (details above)"
-  if curl -fsS --max-time 10 -o /dev/null http://127.0.0.1/; then info "nginx is serving FileBrowser on port 80"
-  else warn "nginx didn't answer on port 80; check: systemctl status nginx"; fi
+  if curl -fsS --max-time 10 -o /dev/null http://127.0.0.1/ 2>/dev/null || curl -fsSk --max-time 10 -o /dev/null https://127.0.0.1/ 2>/dev/null; then
+    info "nginx is serving FileBrowser"
+  else
+    warn "nginx didn't answer; check: systemctl status nginx"
+  fi
 
   # ---- done
   local PW=""
@@ -465,7 +578,8 @@ EOF
   echo -e "${C_G} FileBrowser is installed!${C_0}"
   echo -e "${C_G}======================================================${C_0}"
   echo
-  echo "  Open:            http://${ip}/"
+  if https_on "$(ngx_site)"; then echo "  Open:            https://$(site_domain "$(ngx_site)")/"
+  else echo "  Open:            http://${ip}/"; fi
   if [[ -n "$PW" ]]; then
     echo "  Username:        ${PW%% *}"
     echo "  Password:        ${PW#* }   (one-time; you'll be asked to change it)"
@@ -476,7 +590,7 @@ EOF
   echo "  Config:          $FB_CONFIG"
   echo
   echo "  Tip: start uploads from the 'Files' view, not from a settings page."
-  echo "  Recommended next: fail2ban, swap, and HTTPS once you have a domain."
+  echo "  Recommended next: fail2ban, swap, and a domain (DuckDNS) + HTTPS."
 }
 
 write_nginx_site() {
@@ -516,7 +630,8 @@ EOF
 # ==================================================================== check ==
 do_check() {
   CHK_BAD=0; CHK_WARN=0
-  local VER LATEST DATA PORT URL LISTEN line
+  local VER LATEST DATA PORT URL LISTEN line SITE
+  SITE="$(ngx_site)"
 
   step "FileBrowser"
   if ! fb_installed; then
@@ -547,7 +662,8 @@ do_check() {
     else
       c_bad "Site not answering through nginx"
     fi
-    if grep -qE 'client_max_body_size[[:space:]]+0;' "$NGX_SITE" 2>/dev/null; then c_ok "No nginx upload size limit"
+    c_info "Site file: $SITE"
+    if grep -qE 'client_max_body_size[[:space:]]+0;' "$SITE" 2>/dev/null; then c_ok "No nginx upload size limit"
     else c_warn "nginx may limit upload size (client_max_body_size)"; fi
 
     step "Where things live"
@@ -585,7 +701,7 @@ do_check() {
     step "Share links"
     c_info "Share links use: ${URL:-(not set)}"
     if [[ "$URL" == https://* ]]; then c_ok "Share links use HTTPS"
-    elif grep -q "managed by Certbot" "$NGX_SITE" 2>/dev/null; then c_warn "HTTPS is set up but share links still use http (externalUrl in $FB_CONFIG)"
+    elif https_on "$SITE"; then c_warn "HTTPS is set up but share links still use http (fix it with the HTTPS option)"
     fi
   fi
 
@@ -610,13 +726,26 @@ do_check() {
   else
     c_warn "fail2ban isn't running (brute-force protection)"
   fi
-  if grep -q "managed by Certbot" "$NGX_SITE" 2>/dev/null; then
-    c_ok "HTTPS enabled"
-    if grep -q "Strict-Transport-Security" "$NGX_SITE"; then c_ok "HSTS header set"; else c_info "HSTS not enabled"; fi
+  if https_on "$SITE"; then
+    c_ok "HTTPS enabled ($(site_domain "$SITE"))"
+    if cert_info "$SITE"; then
+      if (( CERT_DAYS < 0 )); then c_bad "Certificate EXPIRED on $CERT_END"
+      elif (( CERT_DAYS < 15 )); then c_warn "Certificate expires in $CERT_DAYS days ($CERT_END) and hasn't renewed yet"
+      else c_ok "Certificate valid until $CERT_END ($CERT_DAYS days)"; fi
+    fi
+    if grep -q "Strict-Transport-Security" "$SITE"; then c_ok "HSTS header set"; else c_info "HSTS not enabled"; fi
     if systemctl is-enabled --quiet certbot.timer 2>/dev/null; then c_ok "Certificate auto-renewal enabled"
     else c_warn "certbot.timer not enabled; the certificate won't renew automatically"; fi
   else
-    c_warn "Plain HTTP; passwords travel unencrypted (set up HTTPS once you have a domain)"
+    c_warn "Plain HTTP; passwords travel unencrypted (set up a domain + HTTPS)"
+  fi
+
+  if duck_configured; then
+    step "DuckDNS"
+    duck_check_lines
+  elif duck_external; then
+    step "DuckDNS"
+    duck_external_lines
   fi
 
   echo
@@ -907,78 +1036,350 @@ EOF
   info "(FileBrowser also has its own lockout: 8 wrong tries per username locks it for 15 min.)"
 }
 
-# ==================================================================== https ==
-do_https() {
-  step "HTTPS with Let's Encrypt"
-  require_fb
-  local DOM EMAIL RESOLVED MYIPS match=no ip HSTS
+# ================================================================== duckdns ==
+duck_check_lines() {
+  local last res age ip d st=0
+  c_info "Names: $(duck_domains | sed 's/,/.duckdns.org, /g').duckdns.org"
+  if systemctl is-active --quiet duckdns-update.timer 2>/dev/null; then c_ok "Updater runs every 5 minutes"
+  else c_bad "Updater isn't scheduled (fix: systemctl enable --now duckdns-update.timer)"; fi
+  last="$(duck_last)"
+  if [[ -z "$last" ]]; then
+    c_warn "No update has run yet"
+  else
+    res="$(awk '{print $3}' <<<"$last")"; age="$(duck_last_age_min)"; ip="$(duck_last_ip)"
+    if [[ "$res" == "OK" ]]; then
+      if (( age > 15 )); then c_warn "Last successful update was $age minutes ago (IP $ip)"
+      else c_ok "Last update OK, $age min ago (IP $ip)"; fi
+    else
+      c_bad "Last update failed: $(cut -d' ' -f3- <<<"$last")"
+    fi
+  fi
+  d="$(duck_first_fqdn)"
+  dns_check "$d" || st=$?
+  case "$st" in
+    0) c_ok "$d resolves to this server ($DNS_IPS)" ;;
+    2) c_warn "$d doesn't resolve yet" ;;
+    *) c_warn "$d resolves to $DNS_IPS (after an IP change, DNS can take a few minutes to catch up)" ;;
+  esac
+}
+
+write_duck_files() {
+  cat > "$DUCK_BIN" <<'EOF'
+#!/bin/sh
+# Managed by filebrowser-setup.sh: tells DuckDNS this server's current public IP.
+. /etc/duckdns.conf
+mkdir -p /var/lib/duckdns
+# The URL (with the token) goes to curl on stdin so the token never shows up in the process list
+r="$(printf 'url = "https://www.duckdns.org/update?domains=%s&token=%s&ip=&verbose=true"\n' \
+      "$DUCKDNS_DOMAINS" "$DUCKDNS_TOKEN" | curl -fsS --max-time 30 -K - 2>&1)" || r="ERROR $r"
+r="$(printf '%s' "$r" | tr '\n' ' ' | tr -s ' ')"
+echo "$(date '+%Y-%m-%d %H:%M:%S') $r" > /var/lib/duckdns/last
+echo "DuckDNS: $r"
+case "$r" in OK*) exit 0 ;; *) exit 1 ;; esac
+EOF
+  chmod 755 "$DUCK_BIN"
+
+  cat > "$DUCK_SVC" <<EOF
+$MARKER
+[Unit]
+Description=Update DuckDNS with this server's IP
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=$DUCK_BIN
+EOF
+
+  cat > "$DUCK_TIMER" <<EOF
+$MARKER
+[Unit]
+Description=Update DuckDNS every 5 minutes
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=5min
+RandomizedDelaySec=30
+
+[Install]
+WantedBy=timers.target
+EOF
+}
+
+duck_remove_old_cron() {
+  local f
+  if command -v crontab >/dev/null 2>&1 && crontab -l 2>/dev/null | grep -qE 'duckdns\.org/update|duck[^[:space:]/]*\.sh'; then
+    echo
+    info "Found an older DuckDNS cron job (probably from duckdns.org's instructions):"
+    crontab -l 2>/dev/null | grep -E 'duckdns\.org/update|duck[^[:space:]/]*\.sh' | sed 's/^/      /'
+    if [[ "$(ask_yn "Remove it? The new updater replaces it." yes)" == yes ]]; then
+      { crontab -l 2>/dev/null | grep -vE 'duckdns\.org/update|duck[^[:space:]/]*\.sh' || true; } | crontab -
+      info "Old cron job removed. (Its folder, often ~/duckdns, can be deleted too.)"
+    fi
+  fi
+  for f in /etc/crontab /etc/cron.d/*; do
+    if [[ -f "$f" ]] && grep -qE 'duckdns\.org/update|duck[^[:space:]/]*\.sh' "$f" 2>/dev/null; then
+      warn "$f also updates DuckDNS; remove that line so they don't both run."
+    fi
+  done
+}
+
+duck_setup() {
+  local SUB TOKEN OLD_SUB OLD_TOKEN BACKUP="" st=0 d
   echo
-  info "You need a domain (e.g. files.example.com) whose DNS A record points"
-  info "at this server, and ports 80 + 443 open in any provider firewall."
+  info "DuckDNS gives you a free name like yourname.duckdns.org and this keeps it"
+  info "pointed at this server. Sign in at https://www.duckdns.org, create a"
+  info "subdomain there, and copy the token shown at the top of the page."
   echo
+  OLD_SUB="$(duck_domains)"
+  OLD_TOKEN="$(sed -nE 's/^DUCKDNS_TOKEN="?([^"]*)"?.*/\1/p' "$DUCK_CONF" 2>/dev/null | head -1 || true)"
+  if [[ -z "$OLD_SUB" && -z "$OLD_TOKEN" ]] && duck_external; then
+    OLD_SUB="$EXT_DOMAINS"; OLD_TOKEN="$EXT_TOKEN"
+    if [[ -n "$OLD_TOKEN" ]]; then info "Using the subdomain and token from your existing DuckDNS cron job."; echo; fi
+  fi
+
   while true; do
-    DOM="$(ask "Domain name" "${DOMAIN:-}")"; DOM="${DOM,,}"
+    SUB="$(ask "Subdomain (e.g. myfiles or myfiles.duckdns.org)" "${OLD_SUB:-${DUCKDNS_DOMAIN:-}}")"
+    SUB="${SUB,,}"; SUB="${SUB// /}"; SUB="${SUB//.duckdns.org/}"
+    if [[ "$SUB" =~ ^[a-z0-9-]+(,[a-z0-9-]+)*$ ]]; then break; fi
+    warn "Just the name part, like myfiles (several can be comma-separated)."
+    if [[ "$ASSUME_YES" == yes ]]; then die "Set DUCKDNS_DOMAIN=yourname"; fi
+  done
+
+  if [[ "$ASSUME_YES" == yes ]]; then
+    TOKEN="${DUCKDNS_TOKEN:-$OLD_TOKEN}"
+  else
+    while true; do
+      if [[ -n "$OLD_TOKEN" ]]; then TOKEN="$(ask_secret "Token (hidden; Enter keeps the current one)")"; TOKEN="${TOKEN:-$OLD_TOKEN}"
+      else TOKEN="$(ask_secret "Token (hidden)")"; fi
+      TOKEN="${TOKEN// /}"; TOKEN="${TOKEN,,}"
+      if [[ "$TOKEN" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]]; then break; fi
+      warn "That doesn't look like a DuckDNS token (it looks like xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx)."
+    done
+  fi
+  [[ "$TOKEN" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]] || die "Missing or invalid token (set DUCKDNS_TOKEN)"
+
+  step "Saving settings and testing them with DuckDNS"
+  apt-get install -y -q curl >/dev/null
+  if [[ -f "$DUCK_CONF" ]]; then BACKUP="${DUCK_CONF}.bak"; cp -p "$DUCK_CONF" "$BACKUP"; fi
+  ( umask 077; printf '%s\nDUCKDNS_DOMAINS="%s"\nDUCKDNS_TOKEN="%s"\n' "$MARKER" "$SUB" "$TOKEN" > "$DUCK_CONF" )
+  write_duck_files
+  if ! "$DUCK_BIN" | sed 's/^/    /'; then
+    if [[ -n "$BACKUP" ]]; then cp -p "$BACKUP" "$DUCK_CONF"
+    else rm -f "$DUCK_CONF" "$DUCK_BIN" "$DUCK_SVC" "$DUCK_TIMER"; rm -rf "$(dirname "$DUCK_STATE")"; fi
+    die "DuckDNS rejected the update (KO usually means a wrong token or a subdomain that isn't on your account). Nothing was changed."
+  fi
+  info "DuckDNS accepted the update ✓"
+
+  systemctl daemon-reload
+  systemctl enable --now duckdns-update.timer >/dev/null 2>&1
+  if systemctl is-active --quiet duckdns-update.timer; then info "Updater scheduled every 5 minutes"
+  else warn "Couldn't start the updater timer; check: systemctl status duckdns-update.timer"; fi
+
+  duck_remove_old_cron
+
+  d="${SUB%%,*}.duckdns.org"
+  dns_check "$d" || st=$?
+  echo
+  case "$st" in
+    0) info "$d → $DNS_IPS (this server) ✓" ;;
+    2) info "$d doesn't resolve yet; give it a minute." ;;
+    *) info "$d currently resolves to $DNS_IPS; it can take a few minutes to update." ;;
+  esac
+  if fb_installed && ! https_on "$(ngx_site)"; then info "Next: set up HTTPS for $d (the HTTPS option will suggest it)."; fi
+}
+
+duck_remove() {
+  if [[ "$(ask_yn "Stop updating DuckDNS and remove the updater?" no)" != yes ]]; then info "Cancelled."; return 0; fi
+  systemctl disable --now duckdns-update.timer >/dev/null 2>&1 || true
+  rm -f "$DUCK_TIMER" "$DUCK_SVC" "$DUCK_BIN" "$DUCK_CONF" "${DUCK_CONF}.bak"
+  rm -rf "$(dirname "$DUCK_STATE")"
+  systemctl daemon-reload
+  info "Removed. Your name still exists at duckdns.org; it just won't follow this server's IP anymore."
+}
+
+do_duckdns() {
+  step "Dynamic DNS (DuckDNS)"
+  local ACT
+  if ! duck_configured && duck_external; then
+    CHK_BAD=0; CHK_WARN=0
+    duck_external_lines
+    echo
+    info "That works fine as it is. Taking it over switches to this script's updater"
+    info "(a systemd timer, with status shown in the menu and health check) using the"
+    info "same subdomain and token, and removes the old cron job."
+    echo
+    if [[ "$(ask_yn "Take it over?" no)" == yes ]]; then duck_setup; fi
+    return 0
+  fi
+  if ! duck_configured; then duck_setup; return 0; fi
+  CHK_BAD=0; CHK_WARN=0
+  duck_check_lines
+  echo
+  echo "  What next?"
+  echo "    u) Update now"
+  echo "    c) Change the subdomain or token"
+  echo "    r) Remove the updater"
+  ACT="$(ask "Choose (or Enter if you're just checking)" "done")"
+  case "${ACT,,}" in
+    u) if "$DUCK_BIN" | sed 's/^/    /'; then info "Updated ✓"; else warn "Update failed (see above)."; fi ;;
+    c) duck_setup ;;
+    r) duck_remove ;;
+    *) return 0 ;;
+  esac
+}
+
+# ==================================================================== https ==
+add_hsts() {
+  local site="$1"
+  if grep -q "Strict-Transport-Security" "$site"; then info "HSTS is already on"; return 0; fi
+  cp "$site" "${site}.bak"
+  # Goes inside the HTTPS server block, right after its "listen ... 443 ssl" line
+  sed -i -E '0,/^([[:space:]]*listen[^;]*443[^;]*ssl[^;]*;.*)$/s//\1\n    add_header Strict-Transport-Security "max-age=15552000; includeSubDomains" always;/' "$site"
+  if grep -q "Strict-Transport-Security" "$site" && nginx_test_reload; then
+    info "HSTS turned on"
+  else
+    cp "${site}.bak" "$site"; systemctl reload nginx || true
+    warn "Couldn't add HSTS; restored the previous config. HTTPS itself still works."
+  fi
+}
+
+set_share_url() {
+  local url="$1"
+  if ! grep -qE '^[[:space:]]*externalUrl:' "$FB_CONFIG"; then
+    warn "No externalUrl line in $FB_CONFIG. Add it under 'http:' as:  externalUrl: \"$url\""
+    return 0
+  fi
+  cp -p "$FB_CONFIG" "${FB_CONFIG}.bak"
+  sed -i -E "s|^([[:space:]]*externalUrl:).*|\1 \"${url}\"|" "$FB_CONFIG"
+  systemctl restart filebrowser
+  if wait_for_fb; then
+    info "Share links now use $url (links made earlier keep their old address; recreate any you need)"
+  else
+    cp -p "${FB_CONFIG}.bak" "$FB_CONFIG"; systemctl restart filebrowser || true
+    die "FileBrowser didn't restart; restored the previous config."
+  fi
+}
+
+https_status() {
+  local SITE="$1" DOM URL ACT st=0 CAN_HSTS=no CAN_SHARE=no
+  CHK_BAD=0; CHK_WARN=0
+  DOM="$(site_domain "$SITE")"
+  c_info "nginx site: $SITE"
+  c_ok "HTTPS is set up for $DOM"
+  if cert_info "$SITE"; then
+    if (( CERT_DAYS < 0 )); then c_bad "Certificate EXPIRED on $CERT_END"
+    elif (( CERT_DAYS < 15 )); then c_warn "Certificate expires in $CERT_DAYS days ($CERT_END) and hasn't renewed yet"
+    else c_ok "Certificate valid until $CERT_END ($CERT_DAYS days left)"; fi
+  else
+    c_warn "Couldn't read the certificate details"
+  fi
+  if systemctl is-enabled --quiet certbot.timer 2>/dev/null; then c_ok "Auto-renewal scheduled (renews about 30 days before expiry)"
+  else c_warn "certbot.timer isn't enabled, so the certificate won't renew by itself"; fi
+  if grep -q 'return 301 https://' "$SITE"; then c_ok "http:// redirects to https://"
+  else c_warn "http:// isn't redirected to https://"; fi
+  if grep -q "Strict-Transport-Security" "$SITE"; then c_ok "HSTS on"
+  else c_info "HSTS off"; CAN_HSTS=yes; fi
+  URL="$(cfg_value externalUrl)"
+  if [[ "$URL" == "https://$DOM" ]]; then c_ok "Share links use https://$DOM"
+  else c_warn "Share links use ${URL:-(not set)} instead of https://$DOM"; CAN_SHARE=yes; fi
+  dns_check "$DOM" || st=$?
+  case "$st" in
+    0) c_ok "$DOM resolves to this server ($DNS_IPS)" ;;
+    2) c_bad "$DOM doesn't resolve" ;;
+    *) c_warn "$DOM resolves to $DNS_IPS, not this server" ;;
+  esac
+  if [[ "$DOM" == *.duckdns.org ]] && ! duck_configured; then
+    c_info "Tip: the DuckDNS option keeps $DOM pointed at this server if its IP changes"
+  fi
+
+  echo
+  echo "  What next?"
+  echo "    t) Test certificate renewal (dry run)"
+  if [[ "$CAN_HSTS" == yes ]]; then echo "    h) Turn on HSTS"; fi
+  if [[ "$CAN_SHARE" == yes ]]; then echo "    s) Make share links use https://$DOM"; fi
+  echo "    n) Move to a different domain"
+  ACT="$(ask "Choose (or Enter if you're just checking)" "done")"
+  case "${ACT,,}" in
+    t)
+      step "Testing certificate renewal"
+      if certbot renew --dry-run 2>&1 | tail -4 | sed 's/^/    /'; then :; fi
+      if certbot renew --dry-run >/dev/null 2>&1; then info "Renewal works ✓"; else warn "Renewal test failed; see: certbot renew --dry-run"; fi ;;
+    h) add_hsts "$SITE" ;;
+    s) set_share_url "https://$DOM" ;;
+    n) https_setup "$SITE" "$DOM" ;;
+    *) return 0 ;;
+  esac
+}
+
+https_setup() {
+  local SITE="$1" OLD="$2" DOM DEF EMAIL HSTS=no st=0
+  [[ -f "$SITE" ]] || die "nginx site config not found ($SITE). Run the install first."
+  echo
+  info "You need a domain (e.g. files.example.com or yourname.duckdns.org) that"
+  info "points at this server, and ports 80 + 443 open in any provider firewall."
+  echo
+  DEF="${DOMAIN:-$(duck_first_fqdn)}"
+  if [[ -n "$OLD" && "$DEF" == "$OLD" ]]; then DEF=""; fi
+  while true; do
+    DOM="$(ask "Domain name" "$DEF")"; DOM="${DOM,,}"
+    if [[ -n "$OLD" && "$DOM" == "$OLD" ]]; then warn "That's the current domain."; continue; fi
     if [[ "$DOM" =~ ^([a-z0-9]([a-z0-9-]*[a-z0-9])?\.)+[a-z]{2,}$ ]]; then break; fi
     warn "Enter a domain like files.example.com (no http://, not an IP address)."
     if [[ "$ASSUME_YES" == yes ]]; then die "Invalid domain: '$DOM'"; fi
   done
 
-  RESOLVED="$(getent ahostsv4 "$DOM" 2>/dev/null | awk '{print $1}' | sort -u | paste -sd' ' - || true)"
-  MYIPS="$(hostname -I 2>/dev/null || true)"
-  if [[ -z "$RESOLVED" ]]; then
-    warn "$DOM doesn't resolve to any address yet. Set up the DNS record first."
-    if [[ "$(ask_yn "Try anyway?" no)" != yes ]]; then info "Cancelled."; return 0; fi
-  else
-    for ip in $RESOLVED; do if [[ " $MYIPS " == *" $ip "* ]]; then match=yes; fi; done
-    if [[ "$match" == yes ]]; then info "$DOM → $RESOLVED (this server) ✓"
-    else
-      warn "$DOM points to $RESOLVED, but this server's addresses are: $MYIPS"
+  dns_check "$DOM" || st=$?
+  case "$st" in
+    0) info "$DOM → $DNS_IPS (this server) ✓" ;;
+    2)
+      warn "$DOM doesn't resolve to any address yet."
+      if [[ "$DOM" == *.duckdns.org ]] && ! duck_configured; then warn "Set it up with the DuckDNS option first."; fi
+      if [[ "$(ask_yn "Try anyway?" no)" != yes ]]; then info "Cancelled."; return 0; fi ;;
+    *)
+      warn "$DOM points to $DNS_IPS, but this server's addresses are: $(hostname -I 2>/dev/null)"
       warn "Fine behind NAT/a proxy; otherwise the certificate request will fail."
-      if [[ "$(ask_yn "Continue anyway?" no)" != yes ]]; then info "Cancelled."; return 0; fi
-    fi
-  fi
+      if [[ "$(ask_yn "Continue anyway?" no)" != yes ]]; then info "Cancelled."; return 0; fi ;;
+  esac
 
   while true; do
-    EMAIL="$(ask "Email for certificate expiry notices" "${CERTBOT_EMAIL:-}")"
-    if [[ "$EMAIL" == *@*.* && "$EMAIL" != *" "* ]]; then break; fi
-    warn "Enter a valid email address."
+    EMAIL="$(ask "Email for certificate expiry notices (Enter to skip)" "${CERTBOT_EMAIL:-}")"
+    if [[ -z "$EMAIL" || ( "$EMAIL" == *@*.* && "$EMAIL" != *" "* ) ]]; then break; fi
+    warn "Enter a valid email address, or leave it blank."
     if [[ "$ASSUME_YES" == yes ]]; then die "Invalid email"; fi
   done
-  echo
-  info "HSTS tells browsers to only ever use HTTPS for this domain (for 6 months)."
-  info "Recommended, but once on, you can't easily go back to plain HTTP."
-  HSTS="$(ask_yn "Enable HSTS?" yes)"
+  if ! grep -q "Strict-Transport-Security" "$SITE"; then
+    echo
+    info "HSTS tells browsers to only ever use HTTPS for this domain (for 6 months)."
+    info "Recommended, but once on, you can't easily go back to plain HTTP."
+    HSTS="$(ask_yn "Enable HSTS?" yes)"
+  fi
 
   step "Pointing nginx at $DOM"
-  [[ -f "$NGX_SITE" ]] || die "nginx site config not found at $NGX_SITE"
-  cp "$NGX_SITE" "${NGX_SITE}.bak"
-  if ! grep -qE "server_name[^;]*[[:space:]]${DOM//./\\.}[[:space:];]" "$NGX_SITE"; then
-    sed -i -E "0,/server_name ([^;]*);/s//server_name ${DOM};/" "$NGX_SITE"
+  cp "$SITE" "${SITE}.bak"
+  if [[ -n "$OLD" ]]; then
+    # Moving domains: rename everywhere except the certificate paths (certbot replaces those)
+    sed -i "/ssl_certificate/! s/${OLD//./\\.}/${DOM}/g" "$SITE"
+  elif ! grep -qE "server_name[^;]*[[:space:]]${DOM//./\\.}[[:space:];]" "$SITE"; then
+    sed -i -E "0,/server_name ([^;]*);/s//server_name ${DOM};/" "$SITE"
   fi
   if ! nginx_test_reload; then
-    cp "${NGX_SITE}.bak" "$NGX_SITE"; systemctl reload nginx || true
+    cp "${SITE}.bak" "$SITE"; systemctl reload nginx || true
     die "nginx rejected the change; restored the previous config."
   fi
 
   step "Requesting the certificate"
-  apt-get install -y -q python3-certbot-nginx >/dev/null
-  if ! certbot --nginx -d "$DOM" --non-interactive --agree-tos -m "$EMAIL" --redirect; then
-    die "Certbot couldn't get a certificate. Usual causes: DNS not pointing here yet, or ports 80/443 blocked in your VPS provider's firewall."
+  apt-get install -y -q python3-certbot-nginx openssl >/dev/null
+  local -a EMAIL_ARGS=(--register-unsafely-without-email)
+  if [[ -n "$EMAIL" ]]; then EMAIL_ARGS=(-m "$EMAIL"); fi
+  if ! certbot --nginx -d "$DOM" --non-interactive --agree-tos "${EMAIL_ARGS[@]}" --redirect; then
+    cp "${SITE}.bak" "$SITE"; systemctl reload nginx || true
+    die "Certbot couldn't get a certificate, so nginx was put back as it was. Usual causes: DNS not pointing here yet, or ports 80/443 blocked in your provider's firewall."
   fi
+  if [[ "$HSTS" == yes ]]; then add_hsts "$SITE"; fi
 
-  if [[ "$HSTS" == yes ]] && ! grep -q "Strict-Transport-Security" "$NGX_SITE"; then
-    cp "$NGX_SITE" "${NGX_SITE}.bak"
-    sed -i '0,/client_max_body_size 0;/s//client_max_body_size 0;\n    add_header Strict-Transport-Security "max-age=15552000; includeSubDomains" always;/' "$NGX_SITE"
-    if nginx_test_reload; then info "HSTS header added"
-    else cp "${NGX_SITE}.bak" "$NGX_SITE"; systemctl reload nginx || true; warn "Couldn't add HSTS; restored the config. HTTPS itself works."; fi
-  fi
-
-  step "Updating share links to https://${DOM}"
-  cp -p "$FB_CONFIG" "${FB_CONFIG}.bak"
-  sed -i -E "s|^([[:space:]]*externalUrl:).*|\1 \"https://${DOM}\"|" "$FB_CONFIG"
-  systemctl restart filebrowser
-  if wait_for_fb; then info "FileBrowser restarted with the new share-link address"
-  else cp -p "${FB_CONFIG}.bak" "$FB_CONFIG"; systemctl restart filebrowser || true; die "FileBrowser didn't restart; restored the previous config."; fi
+  step "Updating share links"
+  set_share_url "https://${DOM}"
 
   systemctl enable --now certbot.timer >/dev/null 2>&1 || true
   if systemctl is-enabled --quiet certbot.timer 2>/dev/null; then info "Certificate auto-renewal enabled"; fi
@@ -987,9 +1388,17 @@ do_https() {
   else
     warn "Couldn't confirm https://${DOM} from the server itself; try it in your browser."
   fi
+  if [[ -n "$OLD" ]]; then info "The old certificate isn't used anymore; remove it with: certbot delete --cert-name $OLD"; fi
   echo
   info "Done: https://${DOM}/"
-  info "Note: share links created before this still show the old address; recreate any you need."
+}
+
+do_https() {
+  local SITE
+  step "HTTPS with Let's Encrypt"
+  require_fb
+  SITE="$(ngx_site)"
+  if https_on "$SITE"; then https_status "$SITE"; else https_setup "$SITE" ""; fi
 }
 
 # ===================================================================== menu ==
@@ -1011,7 +1420,7 @@ run_action() {
 }
 
 menu() {
-  local choice s_fb s_swap s_f2b s_https
+  local choice s_fb s_swap s_f2b s_https s_duck site
   while true; do
     if fb_installed; then
       if systemctl is-active --quiet filebrowser 2>/dev/null; then s_fb="${C_G}running${C_0} · $(fb_version) · $(cfg_value externalUrl)"
@@ -1021,7 +1430,26 @@ menu() {
     fi
     if swapon --show --noheadings 2>/dev/null | grep -q .; then s_swap="${C_G}[$(free -h | awk '/^Swap:/ {print $2}')]${C_0}"; else s_swap="${C_D}[none]${C_0}"; fi
     if systemctl is-active --quiet fail2ban 2>/dev/null; then s_f2b="${C_G}[on]${C_0}"; else s_f2b="${C_D}[off]${C_0}"; fi
-    if grep -q "managed by Certbot" "$NGX_SITE" 2>/dev/null; then s_https="${C_G}[on]${C_0}"; else s_https="${C_D}[off]${C_0}"; fi
+    if duck_configured; then
+      if [[ "$(duck_last | awk '{print $3}')" == "OK" ]]; then s_duck="${C_G}[on · $(duck_first_fqdn)]${C_0}"
+      else s_duck="${C_Y}[on · last update failed]${C_0}"; fi
+    elif duck_external; then
+      if [[ -n "$EXT_DOMAINS" ]]; then s_duck="${C_G}[on · ${EXT_DOMAINS%%,*}.duckdns.org · via cron]${C_0}"
+      else s_duck="${C_G}[on · via cron]${C_0}"; fi
+    else
+      s_duck="${C_D}[off]${C_0}"
+    fi
+    site="$(ngx_site)"
+    if https_on "$site"; then
+      if cert_info "$site"; then
+        if (( CERT_DAYS < 15 )); then s_https="${C_Y}[on · $(site_domain "$site") · ${CERT_DAYS} days left]${C_0}"
+        else s_https="${C_G}[on · $(site_domain "$site") · ${CERT_DAYS} days left]${C_0}"; fi
+      else
+        s_https="${C_G}[on · $(site_domain "$site")]${C_0}"
+      fi
+    else
+      s_https="${C_D}[off]${C_0}"
+    fi
     echo
     echo -e "${C_B}  ==================================================${C_0}"
     echo -e "${C_B}   FileBrowser Quantum setup${C_0}"
@@ -1033,9 +1461,10 @@ menu() {
     echo    "   2) Check setup"
     echo    "   3) Update FileBrowser"
     echo    "   4) Reset a password / add a user"
-    echo -e "   5) Swap file                     ${s_swap}"
-    echo -e "   6) fail2ban (block brute-force)  ${s_f2b}"
-    echo -e "   7) HTTPS with Let's Encrypt      ${s_https}"
+    echo -e "   5) Swap file                          ${s_swap}"
+    echo -e "   6) fail2ban (block brute-force)       ${s_f2b}"
+    echo -e "   7) DuckDNS (set up or check)          ${s_duck}"
+    echo -e "   8) HTTPS (set up or check)            ${s_https}"
     echo    "   q) Quit"
     echo
     printf '  Choose an option: ' >/dev/tty
@@ -1047,10 +1476,11 @@ menu() {
       4) run_action password ;;
       5) run_action swap ;;
       6) run_action fail2ban ;;
-      7) run_action https ;;
+      7) run_action duckdns ;;
+      8) run_action https ;;
       q|quit|exit) echo; exit 0 ;;
       "") continue ;;
-      *) warn "Pick 1-7 or q."; continue ;;
+      *) warn "Pick 1-8 or q."; continue ;;
     esac
     if (( RUN_RC != 0 )); then warn "That option didn't finish (see the error above)."; fi
     pause
