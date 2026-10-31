@@ -7,12 +7,19 @@ Storage VPS options:
 https://deluxhost.net/en/storage
 
 Selected:
+
 Intel Storage-2
+
 Cores: 2vCore
+
 RAM: 3gb
+
 Storage: 10gb
+
 Primary Disk: 1TB
+
 Bandwidth: 1Gbit/s
+
 
 Price: 1.99 Euro/mo (~$2.25/mo USD)
 
@@ -25,6 +32,7 @@ https://filebrowserquantum.com/en/
 # Actions to take in order to be done in order to contain the files to be delivered upon future requests.
 
 ## Run this script:
+https://raw.githubusercontent.com/honeybugserial/cheap-storage-vps-debian-file-browser-quantum-not-for-piracy/refs/heads/main/Installs_filebrowser-quantum-debian.txt.sh
 
 ***OR***
 
