@@ -29,6 +29,8 @@ https://filebrowserquantum.com/en/
 
 # Actions to take in order to be done in order to contain the files to be delivered upon future requests.
 
+![FileBrowser setup menu](https://raw.githubusercontent.com/honeybugserial/cheap-storage-vps-debian-file-browser-quantum-not-for-piracy/refs/heads/main/screenshot.png)
+
 ## Run this script:
 https://raw.githubusercontent.com/honeybugserial/cheap-storage-vps-debian-file-browser-quantum-not-for-piracy/refs/heads/main/Installs_filebrowser-quantum-debian.txt.sh
 
