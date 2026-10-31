@@ -28,7 +28,7 @@ https://filebrowserquantum.com/en/
 ## Run this script:
 https://raw.githubusercontent.com/honeybugserial/cheap-storage-vps-debian-file-browser-quantum-not-for-piracy/refs/heads/main/Installs_filebrowser-quantum-debian.txt.sh
 
-***OR***
+***--- OR ---***
 
 ## Copy Pasta
 
