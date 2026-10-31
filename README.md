@@ -1,7 +1,8 @@
 # Cheap storage hosting with DeluxeHost and FileBrowser Quantum
 
 - I have been using this for a while and it seems to be decent enough. I just use this for general crap I don't super care about. For the little currency it costs coupled with the power of lazy, good enough.
-- Oh also probably want to put a ssl cert on it, or don't, what do I care I am not your mother. 
+- Oh also probably want to put a ssl cert on it, or don't, what do I care I am not your mother.
+- this also assumes you have storage mounted under /mnt/data because I put mine there. so do the same or change it.
 
 ### Deluxe Host
 https://deluxhost.net/
