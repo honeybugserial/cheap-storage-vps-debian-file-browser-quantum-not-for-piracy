@@ -18,6 +18,7 @@ Price: 1.99 Euro/mo (~$2.25/mo USD)
 
 ### FileBrowser Quantum
 For putting files inside the computer without all of the extra plugin app let's do everything type bullshit that adds so much overhead.
+
 https://filebrowserquantum.com/en/
 
 ---
