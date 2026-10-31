@@ -1,5 +1,7 @@
 # Cheap storage hosting with DeluxeHost and FileBrowser Quantum
 
+- I have been using this for a while and it seems to be decent enough. I just use this for general crap I don't super care about. For the little currency it costs coupled with the power of lazy, good enough.
+
 ### Deluxe Host
 https://deluxhost.net/
 
